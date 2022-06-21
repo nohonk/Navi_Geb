@@ -1,200 +1,347 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_HMC5883_U.h>
-#include <CompassHeading.h>
 
-/*
- * Created by ArduinoGetStarted.com
- *
- * This example code is in the public domain
- *
- * Tutorial page: https://arduinogetstarted.com/tutorials/arduino-gps
- */
-
+//#include <Wire.h>
 #include <TinyGPSPlus.h>
 #include <SoftwareSerial.h>
-
-const int RXPin = 3, TXPin = 4;
-const uint32_t GPSBaud = 9600; //Default baud of NEO-6M is 9600
-#define   dataPin   13   //DS Pin of 74HC595(Pin14)
-#define   latchPin  12   //ST_CP Pin of 74HC595(Pin12)
-#define   clockPin 11    //CH_CP Pin of 74HC595(Pin11)
-#define GPS_AVAIL_LED 5
-static const double LONDON_LAT = 52.227068, LONDON_LON = 10.575161;
-#define NORD      0x80
-#define NORD_OST  0x01
-#define OST       0x02
-#define SUED_OST  0x04
-#define SUED      0x08
-#define SUED_WEST 0x10
-#define WEST      0x20
-#define NORD_WEST 0x40
-
-TinyGPSPlus gps; // the TinyGPS++ object
-SoftwareSerial gpsSerial(RXPin, TXPin); // the serial interface to the GPS device
-#define DECLINATION_ANGLE 0.22
-CompassHeading compass = CompassHeading(DECLINATION_ANGLE);
-float heading, oldheading;
-float ledDirection;
-unsigned char x;
-uint8_t ledState = LOW;
-uint16_t ledCounter = 0;
-uint32_t millisCounter = 0;
-const uint16_t NoGpsLed = 500;
-const uint16_t InValidGpsLed = 250;
+#include <PWMServo.h>
 
 
-void _shiftOut(int dPin,int cPin,int order,int val){   
-	int i;  
-    for(i = 0; i < 8; i++){
-        digitalWrite(cPin,LOW);
-        if(order == LSBFIRST){
-            digitalWrite(dPin,((0x01&(val>>i)) == 0x01) ? HIGH : LOW);
-            delayMicroseconds(10);
-		}
-        else {//if(order == MSBFIRST){
-            digitalWrite(dPin,((0x80&(val<<i)) == 0x80) ? HIGH : LOW);
-            delayMicroseconds(10);
-		}
-        digitalWrite(cPin,HIGH);
-        delayMicroseconds(10);
-	}
+PWMServo myservo;
+/*
+   This sample sketch demonstrates the normal use of a TinyGPSPlus (TinyGPSPlus) object.
+   It requires the use of SoftwareSerial, and assumes that you have a
+   4800-baud serial GPS device hooked up on pins 4(rx) and 3(tx).
+*/
+static const int RXPin = 4, TXPin = 3;
+static const uint32_t GPSBaud = 9600;
+
+// The TinyGPSPlus object
+TinyGPSPlus gps;
+
+// The serial connection to the GPS device
+SoftwareSerial ss(RXPin, TXPin);
+
+
+
+enum class Direction : uint8_t
+{
+  RECHTS = 0,
+  VORNE,
+  LINKS
+};
+
+class Position
+{
+public:
+  Position(double lat, double lon)
+  {
+    lat_ = lat;
+    lon_ = lon;
+  }
+
+  void setPosition(double lat, double lon)
+  {
+    lat_ = lat;
+    lon_ = lon;
+  }
+
+  void setPosition(Position pos)
+  {
+    lat_ = pos.lat();
+    lon_ = pos.lon();
+  }
+
+  double lat()
+  {
+    return lat_;
+  }
+
+  double lon()
+  {
+    return lon_;
+  }
+
+private:
+  double lat_;
+  double lon_;
+};
+
+class Waypoint : public Position
+{
+public:
+  Waypoint(double lat, double lon, Direction direction) : Position(lat, lon)
+  {
+    direction_ = direction;
+  }
+
+  Direction getDirection()
+  {
+    return direction_;
+  }
+
+  void setWayPoint(Waypoint waypoint)
+  {
+    direction_ = waypoint.getDirection();
+    setPosition(waypoint.lat(), waypoint.lon());
+  }
+ 
+private:
+  Direction direction_;
+};
+
+Waypoint lastTarget(0.0,0.0,Direction::VORNE);
+Waypoint nextTarget(0.0,0.0,Direction::VORNE);
+Position currentPosition(0.0,0.0);
+
+const int numberOfWaypoints = 3;
+
+Waypoint WegPunkt[numberOfWaypoints] =
+{
+  {52.225321, 10.571335, Direction::LINKS},
+  {52.225265,10.57084, Direction::RECHTS},
+  {52.226474, 10.570037, Direction::LINKS}
+};
+
+int targetIdx = 1;
+const int numberOfWege = 11;
+// TESTDATA
+Position weg[12] =
+{
+  {52.225321, 10.571335},
+  {52.225281, 10.571107},
+  {52.225278, 10.570899},
+  {52.225372, 10.570768},
+  {52.225575, 10.570672},
+  {52.225855, 10.570548},
+  {52.226154, 10.570399},
+  {52.226357, 10.57024},
+  {52.226462, 10.57009},
+  {52.226432, 10.569987},
+  {52.226349, 10.569916},
+  {52.226227, 10.569791} 
+
+};
+
+int testidx = 0;
+
+enum class State : uint8_t
+{
+  AUF_DEM_WEG = 0,
+  AM_WEGPUNKT,
+  HINTERM_WEGPUNKT
+};
+
+State state = State::AUF_DEM_WEG; 
+double lastDistanceToNext;
+double lastDistanceToLast;
+
+void setup()
+{
+  Serial.begin(9600);
+  ss.begin(GPSBaud);
+  myservo.attach(9);
+
+  myservo.write(90);
+  nextTarget.setWayPoint(WegPunkt[1]);
+  lastTarget.setWayPoint(WegPunkt[0]);
+Serial.println("STARTING");
 }
 
 
+void loop()
+{
+  // This sketch displays information every time a new sentence is correctly encoded.
+  while (ss.available() > 0)
+  {
+    if (gps.encode(ss.read()))
+    {
+      Serial.print(F("Location: ")); 
+      if (gps.location.isValid())
+      {
+        Serial.print(gps.location.lat(), 6);
+        Serial.print(F(","));
+        Serial.print(gps.location.lng(), 6);
+        currentPosition.setPosition(gps.location.lat(), gps.location.lng());
+      }
+      else
+      {
+        Serial.print(F("INVALID"));
+      }
+    }
+  }
+  if (millis() > 5000 && gps.charsProcessed() < 10)
+  {
+    Serial.println(F("No GPS detected: check wiring."));
+    while(true);
+  }
+
+  double distanceToNext =
+    TinyGPSPlus::distanceBetween(
+      currentPosition.lat(),
+      currentPosition.lon(),
+      nextTarget.lat(), 
+      nextTarget.lon());
+
+    double distanceToLast =
+    TinyGPSPlus::distanceBetween(
+      currentPosition.lat(),
+      currentPosition.lon(),
+      lastTarget.lat(), 
+      lastTarget.lon());  
+
+  Serial.print("Abstand in Metern zu Wegpunkt Nr. ");
+  Serial.print(targetIdx);
+  Serial.print(" : ");
+  Serial.println(distanceToNext);  
+
+  switch (state)
+  {
+    case State::AUF_DEM_WEG:
+      if (distanceToNext < 18.0)
+      { 
+        state = State::AM_WEGPUNKT;
+          
+      }
+      break;
+    case State::AM_WEGPUNKT:
+      Serial.println((uint8_t)nextTarget.getDirection());
+      myservo.write((uint8_t)nextTarget.getDirection() * 90);
+      
+      if (targetIdx < numberOfWaypoints-1)
+      {
+        lastTarget.setWayPoint(WegPunkt[targetIdx]);
+        targetIdx++;
+        nextTarget.setWayPoint(WegPunkt[targetIdx]);
+      }
+      state = State::HINTERM_WEGPUNKT;
+      break;
+    case State::HINTERM_WEGPUNKT:
+
+      //TODO Absichern, dass ich in der richtigen Richtung vom Wegpunkt erntfernt wird.
+      // GGf. Wegpunkte zurücksetzen
+      // ggf. zwischenwegpunkt mit geradeausrichtung einführen um abstände eindeutiger zu machen.
+      // Evtl. den Abstand zu den Wegpunkten als INformation dazugeben, damit man nicht weiter weg muss als der nächste wegpunkt weg ist.
+
+      if (distanceToLast > 10.0) 
+      {
+        myservo.write((uint8_t)Direction::VORNE * 90);
+        state = State::AUF_DEM_WEG;
+      }
+      break;
+    default:
+      break;
+  }
+
+  if ( testidx < numberOfWege)
+  {
+    testidx++;
+  }
+
+}
 
 
-
+#if 0
 
 void setup() {
-  Serial.begin(9600);
-  gpsSerial.begin(GPSBaud);
-  compass.start();
-  Serial.println(F("Arduino - GPS module"));
-  pinMode(dataPin,OUTPUT);
-	pinMode(latchPin,OUTPUT);
-	pinMode(clockPin,OUTPUT);
-  pinMode(GPS_AVAIL_LED, OUTPUT);
+//  myservo.attach(9);
 
+//  myservo.write(90);
+
+ 
 }
+
+
+int gpsSearchPos = 0;
+uint8_t gpsSearchDir = 0;
 
 void loop() {
-  if (gpsSerial.available() > 0) {
-   // Serial.println("Gps Serial available");
-    if (gps.encode(gpsSerial.read())) {
-     // Serial.println("Read true");
-      if (gps.location.isValid()) {
-        Serial.print(F("- latitude: "));
-        Serial.println(gps.location.lat(),6);
-        Serial.print(F("- longitude: "));
-        Serial.println(gps.location.lng(),6); 
-        ledState = HIGH;       
-      } else {
-          if (millis() > millisCounter)
-          {
-            ledState = ledState == LOW ? HIGH : LOW;
-            millisCounter += InValidGpsLed; 
-          }    
-       // Serial.println(F("- location: INVALID"));
-      }
-//      Serial.println();
-    }
-  } else 
-  {
-    if (millis() > millisCounter)
-    {
-      ledState = ledState == LOW ? HIGH : LOW;
-      millisCounter += NoGpsLed; 
-
-    }
-  }
-
-  if (millis() > 5000 && gps.charsProcessed() < 10)
-    Serial.println(F("No GPS data received: check wiring"));
-
-
-  double courseToLondon =
-    TinyGPSPlus::courseTo(
-      gps.location.lat(),
-      gps.location.lng(),
-    //  HERE_LAT,
-    //  HERE_LON,
-      LONDON_LAT, 
-      LONDON_LON);
-
   
+          myservo.write(gpsSearchPos);
+          gpsSearchPos = gpsSearchDir == 0 ? gpsSearchPos+1 : gpsSearchPos-1;
+          if (gpsSearchPos > 180) gpsSearchDir = 1;
+          if (gpsSearchPos < 0) gpsSearchDir = 0;
+          myservo.write(gpsSearchPos); 
+              
+        Serial.println(F("- location: INVALID"));
+      }
+
+#endif
+#if 0
+  currentPosition.setPosition(weg[testidx]);
+
+  double distanceToNext =
+    TinyGPSPlus::distanceBetween(
+      currentPosition.lat(),
+      currentPosition.lon(),
+      nextTarget.lat(), 
+      nextTarget.lon());
+
+    double distanceToLast =
+    TinyGPSPlus::distanceBetween(
+      currentPosition.lat(),
+      currentPosition.lon(),
+      lastTarget.lat(), 
+      lastTarget.lon());  
+
+    Serial.print("Abstand in Metern zu Wegpunkt Nr. ");
+    Serial.print(targetIdx);
+    Serial.print(" : ");
+    Serial.println(distanceToNext);  
+
+    switch (state)
+    {
+      case State::AUF_DEM_WEG:
+        if (distanceToNext < 10.0)
+        { 
+          state = State::AM_WEGPUNKT;
+           
+        }
+      break;
+      case State::AM_WEGPUNKT:
+          Serial.println((uint8_t)nextTarget.getDirection());
+          myservo.write((uint8_t)nextTarget.getDirection() * 90);
+          
+          if (targetIdx < numberOfWaypoints-1)
+          {
+            lastTarget.setWayPoint(WegPunkt[targetIdx]);
+            targetIdx++;
+            nextTarget.setWayPoint(WegPunkt[targetIdx]);
+          }
+          state = State::HINTERM_WEGPUNKT;
+      break;
+      case State::HINTERM_WEGPUNKT:
+
+      //TODO Absichern, dass ich in der richtigen Richtung vom Wegpunkt erntfernt wird.
+      // GGf. Wegpunkte zurücksetzen
+      // ggf. zwischenwegpunkt mit geradeausrichtung einführen um abstände eindeutiger zu machen.
+      // Evtl. den Abstand zu den Wegpunkten als INformation dazugeben, damit man nicht weiter weg muss als der nächste wegpunkt weg ist.
 
 
-  oldheading = heading;
-  heading = compass.headingDegrees();
+         // if ((distanceToNext < lastDistanceToNext) && (distanceToLast > lastDistanceToLast))
+         // {
+            if (distanceToLast > 5.0) {
+              myservo.write((uint8_t)Direction::VORNE * 90);
+              state = State::AUF_DEM_WEG;
+            }
+         // }
 
-  ledDirection = courseToLondon - heading;
-  if (ledDirection < 0.0) 
-  {
-    ledDirection += 360.0;
-  }
+      break;
+      default:
+      break;
 
-  if (abs(oldheading - heading) > 5 )
-  {
-    Serial.print("Heading (degrees): "); Serial.println(heading);
-    Serial.print("Kurs nach London ");
-    Serial.println(courseToLondon);
-    Serial.print("Kurs angepasst ");
-    Serial.println(ledDirection);
+    }
 
+    lastDistanceToLast = distanceToLast;
+    lastDistanceToNext = distanceToNext;
 
-  }
-
-  if ( (ledDirection > 337.5) || (ledDirection <= 22.5) )
-  {
-    x = OST;
-    //Serial.println("OST");
-  }
-  if ( (ledDirection > 22.5) && (ledDirection <= 67.5) )
-  {
-    x = NORD_OST;
-    //Serial.println("NORD_OST");
-  }
-  if ( (ledDirection > 67.5) && (ledDirection <= 112.5) )
-  {
-    x = NORD;
-    //Serial.println("NORD");
-  }
-  if ( (ledDirection > 112.5) && (ledDirection <= 157.5) )
-  {
-    x = NORD_WEST;
-    //Serial.println("NORDWEST");
-  }
-  if ( (ledDirection > 157.5) && (ledDirection <= 202.5) )
-  {
-    x = WEST;
-    //Serial.println("WEST");
-  }
-  if ( (ledDirection > 202.5) && (ledDirection <= 247.5) )
-  {
-    x = SUED_WEST;
-    //Serial.println("SUED_WEST");
-  }
-  if ( (ledDirection > 247.5) && (ledDirection <= 292.5) )
-  {
-    x = SUED;
-    //Serial.println("SUED");
-  }
-  if ( (ledDirection > 292.5) && (ledDirection <= 337.5) )
-  {
-    x = SUED_OST;
-    //Serial.println("SUED_OST");
-  }
-
-
-	digitalWrite(latchPin,LOW);		// Output low level to latchPin
-	_shiftOut(dataPin,clockPin,LSBFIRST,x);// Send serial data to 74HC595
-	digitalWrite(latchPin,HIGH);   //Output high level to latchPin, and 74HC595 will update the data to the parallel output port.
-  digitalWrite(GPS_AVAIL_LED, ledState);
+    delay(2000);
+    if ( testidx < numberOfWege)
+    {
+      testidx++;
+    }
 
 }
-
+ #endif
 #if 0
 #include <TinyGPSPlus.h>
 #include <SoftwareSerial.h>
